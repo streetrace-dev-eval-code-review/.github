@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Clone an OSS repo into the streetrace-dev-eval-code-review org for code review evaluation.
 
-Preserves the N latest merged PRs (with passing checks), their discussions,
-review comments, and linked issues. Content is sanitized to look native.
+Preserves the N latest PRs (with passing checks), their discussions,
+review comments, and linked issues. Uses a 50/50 split: N/2 merged PRs and
+N/2 open (non-draft) PRs with all checks passing. Content is sanitized to
+look native.
 """
 
 import argparse
@@ -68,6 +70,9 @@ class GitHub:
 
     def patch(self, url: str, **kwargs):
         return self._request("patch", url, **kwargs)
+
+    def put(self, url: str, **kwargs):
+        return self._request("put", url, **kwargs)
 
     def delete(self, url: str, **kwargs):
         return self._request("delete", url, **kwargs)
@@ -146,7 +151,40 @@ def remap_issue_refs(text: str, issue_map: dict[int, int]) -> str:
 # PR discovery
 # ---------------------------------------------------------------------------
 
-def find_eligible_prs(gh: GitHub, owner: str, repo: str, count: int) -> list[dict]:
+def _check_runs_passed(gh: GitHub, owner: str, repo: str, pr: dict) -> bool:
+    """Return True if all check-runs on a PR's head SHA have passed."""
+    head_sha = pr["head"]["sha"]
+    pr_number = pr["number"]
+
+    resp = gh.get(f"/repos/{owner}/{repo}/commits/{head_sha}/check-runs",
+                  params={"per_page": 100})
+    if resp.status_code != 200:
+        log.warning("Could not fetch check-runs for PR #%d (SHA %s): %s",
+                    pr_number, head_sha[:8], resp.status_code)
+        return False
+
+    runs = resp.json().get("check_runs", [])
+
+    if not runs:
+        log.info("PR #%d has no check-runs, treating as eligible", pr_number)
+        return True
+
+    passed = all(
+        r.get("conclusion") in ("success", "skipped", "neutral")
+        for r in runs
+    )
+
+    if passed:
+        log.info("PR #%d ✓ all %d checks passed", pr_number, len(runs))
+    else:
+        failed = [r["name"] for r in runs
+                  if r.get("conclusion") not in ("success", "skipped", "neutral")]
+        log.debug("PR #%d ✗ failed checks: %s", pr_number, ", ".join(failed[:5]))
+
+    return passed
+
+
+def find_merged_prs(gh: GitHub, owner: str, repo: str, count: int) -> list[dict]:
     """Find the N most recently merged PRs where all check-runs passed."""
     eligible = []
     log.info("Searching for %d eligible merged PRs in %s/%s...", count, owner, repo)
@@ -161,42 +199,35 @@ def find_eligible_prs(gh: GitHub, owner: str, repo: str, count: int) -> list[dic
         if not pr.get("merged_at"):
             continue
 
-        head_sha = pr["head"]["sha"]
-        pr_number = pr["number"]
-
-        # Check check-runs for the head SHA
-        resp = gh.get(f"/repos/{owner}/{repo}/commits/{head_sha}/check-runs",
-                      params={"per_page": 100})
-        if resp.status_code != 200:
-            log.warning("Could not fetch check-runs for PR #%d (SHA %s): %s",
-                        pr_number, head_sha[:8], resp.status_code)
-            continue
-
-        check_data = resp.json()
-        runs = check_data.get("check_runs", [])
-
-        if not runs:
-            # No check-runs at all — treat as eligible (some repos don't use checks)
-            log.info("PR #%d has no check-runs, treating as eligible", pr_number)
+        if _check_runs_passed(gh, owner, repo, pr):
             eligible.append(pr)
-            continue
-
-        # All runs must have conclusion in {success, skipped, neutral}
-        passed = all(
-            r.get("conclusion") in ("success", "skipped", "neutral")
-            for r in runs
-        )
-
-        if passed:
-            log.info("PR #%d ✓ all %d checks passed", pr_number, len(runs))
-            eligible.append(pr)
-        else:
-            failed = [r["name"] for r in runs
-                      if r.get("conclusion") not in ("success", "skipped", "neutral")]
-            log.debug("PR #%d ✗ failed checks: %s", pr_number, ", ".join(failed[:5]))
 
     if len(eligible) < count:
-        log.warning("Only found %d eligible PRs (wanted %d)", len(eligible), count)
+        log.warning("Only found %d eligible merged PRs (wanted %d)", len(eligible), count)
+
+    return eligible
+
+
+def find_open_prs(gh: GitHub, owner: str, repo: str, count: int) -> list[dict]:
+    """Find the N most recent open (non-draft) PRs where all check-runs passed."""
+    eligible = []
+    log.info("Searching for %d eligible open PRs in %s/%s...", count, owner, repo)
+
+    for pr in gh.get_paginated(
+        f"/repos/{owner}/{repo}/pulls",
+        params={"state": "open", "sort": "updated", "direction": "desc"},
+    ):
+        if len(eligible) >= count:
+            break
+
+        if pr.get("draft"):
+            continue
+
+        if _check_runs_passed(gh, owner, repo, pr):
+            eligible.append(pr)
+
+    if len(eligible) < count:
+        log.warning("Only found %d eligible open PRs (wanted %d)", len(eligible), count)
 
     return eligible
 
@@ -514,6 +545,83 @@ def create_repo(gh: GitHub, name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Repo automation control
+# ---------------------------------------------------------------------------
+
+def disable_repo_automation(gh: GitHub, repo_full: str):
+    """Disable GitHub Actions and Dependabot on the target repo."""
+    # Disable GitHub Actions entirely
+    resp = gh.put(f"/repos/{repo_full}/actions/permissions",
+                  json={"enabled": False})
+    if resp.status_code == 204:
+        log.info("Disabled GitHub Actions on %s", repo_full)
+    else:
+        log.warning("Failed to disable Actions on %s: %s %s",
+                    repo_full, resp.status_code, resp.text[:200])
+
+    # Disable Dependabot vulnerability alerts
+    resp = gh.delete(f"/repos/{repo_full}/vulnerability-alerts")
+    if resp.status_code in (204, 404):
+        log.info("Disabled Dependabot vulnerability alerts on %s", repo_full)
+    else:
+        log.warning("Failed to disable vulnerability alerts: %s %s",
+                    resp.status_code, resp.text[:200])
+
+    # Disable Dependabot automatic security fixes
+    resp = gh.delete(f"/repos/{repo_full}/automated-security-fixes")
+    if resp.status_code in (204, 404):
+        log.info("Disabled Dependabot auto security fixes on %s", repo_full)
+    else:
+        log.warning("Failed to disable auto security fixes: %s %s",
+                    resp.status_code, resp.text[:200])
+
+
+# ---------------------------------------------------------------------------
+# Check-run status comment
+# ---------------------------------------------------------------------------
+
+def post_check_status_comment(
+    gh: GitHub,
+    source_owner: str,
+    source_repo: str,
+    source_pr: dict,
+    target_repo_full: str,
+    target_pr_number: int,
+):
+    """Post a comment summarizing the source PR's check-run statuses."""
+    head_sha = source_pr["head"]["sha"]
+    resp = gh.get(f"/repos/{source_owner}/{source_repo}/commits/{head_sha}/check-runs",
+                  params={"per_page": 100})
+    if resp.status_code != 200:
+        log.warning("Could not fetch check-runs for status comment")
+        return
+
+    runs = resp.json().get("check_runs", [])
+    if not runs:
+        return
+
+    status_map = {"success": "passed", "skipped": "skipped", "neutral": "neutral",
+                  "failure": "failed", "cancelled": "cancelled", "timed_out": "timed out"}
+
+    lines = ["| Check | Status |", "| --- | --- |"]
+    for r in sorted(runs, key=lambda r: r["name"]):
+        conclusion = r.get("conclusion") or r.get("status", "unknown")
+        label = status_map.get(conclusion, conclusion)
+        lines.append(f"| {r['name']} | {label} |")
+
+    body = "## CI Check Results\n\n" + "\n".join(lines)
+
+    resp = gh.post(
+        f"/repos/{target_repo_full}/issues/{target_pr_number}/comments",
+        json={"body": body},
+    )
+    if resp.status_code == 201:
+        log.info("Posted check status comment on PR #%d", target_pr_number)
+    else:
+        log.warning("Failed to post check status comment: %s", resp.status_code)
+
+
+# ---------------------------------------------------------------------------
 # Main orchestration
 # ---------------------------------------------------------------------------
 
@@ -541,8 +649,9 @@ def process_tool(
         log.info("[DRY RUN] Would create %s", target_full)
         log.info("[DRY RUN] Would clone %s and push %d PRs", source_url, len(prs))
         for pr in prs:
-            log.info("[DRY RUN] PR #%d: %s (base: %s)",
-                     pr["number"], pr["title"], pr["base"]["sha"][:8])
+            kind = "merged" if pr.get("merged_at") else "open"
+            log.info("[DRY RUN] PR #%d [%s]: %s (base: %s)",
+                     pr["number"], kind, pr["title"], pr["base"]["sha"][:8])
         return
 
     # Step 1: Cleanup
@@ -556,7 +665,10 @@ def process_tool(
         source_url, target_full, prs, token, source_owner, source_repo,
     )
 
-    # Step 4: Collect all issue refs from all PRs first
+    # Step 4: Disable automation before creating PRs
+    disable_repo_automation(gh, target_full)
+
+    # Step 5: Collect all issue refs from all PRs first
     all_issue_refs = set()
     for pr in prs:
         refs = extract_issue_refs(pr.get("body", ""), source_owner, source_repo)
@@ -567,7 +679,7 @@ def process_tool(
     issue_map = copy_issues(gh, source_owner, source_repo, target_full, all_issue_refs)
     log.info("Issue map: %s", issue_map)
 
-    # Step 5: Create PRs
+    # Step 6: Create PRs
     for pr in prs:
         pr_num = pr["number"]
         title = pr["title"]
@@ -613,6 +725,12 @@ def process_tool(
             target_full, new_pr_num, issue_map,
         )
 
+        # Post check-run status summary
+        post_check_status_comment(
+            gh, source_owner, source_repo, pr,
+            target_full, new_pr_num,
+        )
+
     log.info("Done processing %s", target_full)
 
 
@@ -653,13 +771,20 @@ def main():
         sys.exit(1)
     log.info("Authenticated as: %s", user_resp.json().get("login", "unknown"))
 
-    # Find eligible PRs
-    prs = find_eligible_prs(gh, source_owner, source_repo, args.pr_count)
+    # Find eligible PRs: N/2 merged + N/2 open (non-draft) with passing checks
+    merged_count = args.pr_count // 2
+    open_count = args.pr_count - merged_count  # handles odd counts
+
+    merged_prs = find_merged_prs(gh, source_owner, source_repo, merged_count)
+    open_prs = find_open_prs(gh, source_owner, source_repo, open_count)
+
+    prs = merged_prs + open_prs
     if not prs:
         log.error("No eligible PRs found in %s/%s", source_owner, source_repo)
         sys.exit(1)
 
-    log.info("Found %d eligible PRs: %s", len(prs),
+    log.info("Found %d PRs total (%d merged + %d open): %s",
+             len(prs), len(merged_prs), len(open_prs),
              ", ".join(f"#{p['number']}" for p in prs))
 
     # Process each tool
