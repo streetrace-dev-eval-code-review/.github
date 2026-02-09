@@ -1,0 +1,51 @@
+name: Clone Repo for Eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repo URL (e.g. https://github.com/keycloak/keycloak)'
+        required: true
+      generation:
+        description: 'Generation number'
+        required: true
+        default: '1'
+      tools:
+        description: 'Comma-separated tools (default: streetrace)'
+        required: false
+        default: 'streetrace'
+      pr_count:
+        description: 'Number of PRs to preserve (default: 10)'
+        required: false
+        default: '10'
+
+jobs:
+  clone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout .github repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run clone script
+        env:
+          GITHUB_TOKEN: ${{ secrets.EVAL_GITHUB_TOKEN }}
+          INPUT_SOURCE_REPO: ${{ github.event.inputs.source_repo }}
+          INPUT_GENERATION: ${{ github.event.inputs.generation }}
+          INPUT_TOOLS: ${{ github.event.inputs.tools }}
+          INPUT_PR_COUNT: ${{ github.event.inputs.pr_count }}
+        run: |
+          python scripts/clone_for_eval.py \
+            --source-repo "$INPUT_SOURCE_REPO" \
+            --generation "$INPUT_GENERATION" \
+            --tools "$INPUT_TOOLS" \
+            --pr-count "$INPUT_PR_COUNT"
